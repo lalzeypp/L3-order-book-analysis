@@ -14,6 +14,12 @@ Key ChangeReason codes:
 Usage:
   python order_book_analysis.py /path/to/TED_YYYYMMDD.csv
   python order_book_analysis.py /path/to/TED_YYYYMMDD.csv --output results.xlsx
+
+Notes:
+  - The output file specified with --output must have a .xlsx extension.
+  - The Excel output will contain multiple sheets, one for each research question.
+
+  The input CSV file must be semicolon-delimited (;) and match the column format.
 """
 
 import sys
@@ -22,13 +28,13 @@ import duckdb
 import pandas as pd
 from pathlib import Path
 
-# CONSTANTS
+# constants
 
 NEW_REASON = 6          # New order (first entry)
 TRADE_REASON = 3        # Order matched/executed
 NORMAL_ORDER_CAT = 1    # OrderCategory = Order (not quote, not trade report)
 
-# All ChangeReason codes that represent a cancellation
+# ChangeReason codes
 CANCEL_REASONS = (
     1,   # CanceledByUser
     9,   # CanceledBySystem
@@ -50,20 +56,18 @@ LIMIT_ORDER_TYPE = 1   # Limit
 # ExchangeOrderType (EMIR TURU) - bitmask, bit 5 = Undisclosed (iceberg)
 ICEBERG_BIT = 32  # Undisclosed Quantity
 
-# Session classification by SEANS name fragment
+# Session classification
 OPENING_SESSION_PATTERNS = ["ACILIS", "ACS_EMR"]
 CLOSING_SESSION_PATTERNS = ["KAPANIS", "ESLESTIRMETEKFIYAT"]
 
-# Continuous trading hours at BIST (approx)
+# Continuous trading hours at BIST 
 CONTINUOUS_START_HOUR = 10
 CONTINUOUS_END_HOUR = 18
 
-
 # DuckDB
-
 def session_case(time_col: str) -> str:
     """
-    SQL CASE that classifies a timestamp into a display label:
+    Classify:
       - 'A_OPENING'  for opening session
       - 'Z_CLOSING'  for closing session
       - 'HH:MM-HH:MM' 30-min bucket for continuous trading
@@ -94,7 +98,7 @@ def session_case(time_col: str) -> str:
 
 
 def broad_session_case(time_col: str) -> str:
-    """Three-way classification: Opening / Midday / Closing."""
+    """Classifying Opening / Midday / Closing."""
     opening_filter = " OR ".join(
         f"\"SEANS\" LIKE '%{p}%'" for p in OPENING_SESSION_PATTERNS
     )
@@ -122,26 +126,24 @@ def pct(num, denom):
 
 
 # MAIN 
-
 def run_analysis(csv_path: str, output_path=None) -> None:
     con = duckdb.connect()
     results: dict[str, pd.DataFrame] = {}
 
-    print(f"\nLoading CSV via DuckDB: {csv_path}")
-    print("(Large file — DuckDB streams it; no full RAM load needed)\n")
+    print(f"\nLoading CSV via DuckDB (no full RAM load needed): {csv_path}")
 
-    # ── Create view ──────────────────────────────────────────────────────────
-    # Column names contain spaces; we reference them with double-quotes in SQL.
-    # EMIR GIRIS TARIHI  = order entry timestamp
-    # EMIR DEGISTIRILME TARIHI = order change/cancel timestamp
-    # EMIR MIKTARI  = order quantity (lots)
-    # KALAN MIKTAR  = remaining quantity after this event
-    # FIYAT         = price (TL)
-    # EMIR DEGISIKLIK SEBEBI = ChangeReason code
-    # EMIR FIYAT TURU        = OrderType (1=Limit, 2=Market …)
-    # EMIR TURU              = ExchangeOrderType (bitmask)
-    # EMIR KATEGORISI        = 1=Order, 4=Quote, 32=TradeReport
-    # SEANS                  = Session name string
+    # ── Create view ── 
+    # Column names contain spaces; reference them with double-quotes in SQL.
+    # EMIR GIRIS TARIHI                              = order entry timestamp
+    # EMIR DEGISTIRILME TARIHI                       = order change/cancel timestamp
+    # EMIR MIKTARI                                   = order quantity (lots)
+    # KALAN MIKTAR                                   = remaining quantity after this event
+    # FIYAT                                          = price (TL)
+    # EMIR DEGISIKLIK SEBEBI                         = ChangeReason code
+    # EMIR FIYAT TURU                                = OrderType (1=Limit, 2=Market …)
+    # EMIR TURU                                      = ExchangeOrderType (bitmask)
+    # EMIR KATEGORISI                                = 1=Order, 4=Quote, 32=TradeReport
+    # SEANS                                          = Session name string
 
     con.execute(f"""
         CREATE VIEW orders AS
@@ -170,10 +172,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
 
     base_filter = f"order_cat = {NORMAL_ORDER_CAT}"
 
+    # 1 — Total new orders 
     # ════════════════════════════════════════════════════════════════════════
-    # Q1 — Total new orders 
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q1 · Total new orders submitted")
+    print_section("Total new orders submitted:")
     df = con.execute(f"""
         SELECT
             COUNT(*)           AS new_order_count,
@@ -185,10 +186,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     print(df.to_string(index=False))
     results["Q1_new_orders"] = df
 
+    # 2 — Buy vs Sell among new orders (count + volume)
     # ════════════════════════════════════════════════════════════════════════
-    # Q2 — Buy vs Sell among new orders (count + volume)
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q2 · Buy vs. Sell ratio among new orders")
+    print_section("Buy vs. Sell ratio among new orders:")
     q2_totals = con.execute(f"""
         SELECT COUNT(*) AS n, SUM(qty) AS lots, SUM(order_tl) AS tl
         FROM orders WHERE change_reason={NEW_REASON} AND {base_filter}
@@ -210,10 +210,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     print(df.to_string(index=False))
     results["Q2_buy_sell"] = df
 
+    # 3 — Top 10 stocks share of total order volume
     # ════════════════════════════════════════════════════════════════════════
-    # Q3 — Top 10 stocks share of total order volume
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q3 · Top 10 stocks share of total new-order volume")
+    print_section("Top 10 stocks share of total new-order volume:")
     df = con.execute(f"""
         WITH sv AS (
             SELECT
@@ -242,10 +241,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
           f"{top10_pct_tl:.1f}% of TL volume")
     results["Q3_top10_stocks"] = df
 
+    # 4 — 30-min windows: most new orders (opening/closing treated separately)
     # ════════════════════════════════════════════════════════════════════════
-    # Q4 — 30-min windows: most new orders (opening/closing treated separately)
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q4 · New orders per 30-min window (opening/closing separate)")
+    print_section("New orders per 30-min window (opening/closing separate:)")
     sc = session_case("entry_ts")
     df = con.execute(f"""
         WITH classified AS (
@@ -277,13 +275,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
           f"({peak_tl['pct_tl']:.1f}%)")
     results["Q4_windows_new_orders"] = df
 
+    # 5 — Limit and iceberg ratio among new orders # Iceberg identification: any EMIR NO that generated a change_reason=13
     # ════════════════════════════════════════════════════════════════════════
-    # Q5 — Limit and iceberg ratio among new orders
-    # Iceberg identification: any EMIR NO that generated a change_reason=13
-    # (IcebergRefresh) event is definitively an iceberg order. The EMIR TURU
-    # bitmask is unreliable at submission time (change_reason=6 rows).
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q5 · Limit and iceberg order ratio among new orders")
+    print_section("Limit and iceberg order ratio among new orders:")
     df = con.execute(f"""
         WITH iceberg_ids AS (
             SELECT DISTINCT "EMIR NO" AS ono
@@ -315,10 +309,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     print(df.T.to_string())
     results["Q5_order_types"] = df
 
+    # 6 — Ratio: busiest 30-min window / calmest 30-min window
     # ════════════════════════════════════════════════════════════════════════
-    # Q6 — Ratio: busiest 30-min window / calmest 30-min window
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q6 · Busiest vs. calmest 30-min window ratio (new orders)")
+    print_section("Busiest vs. calmest 30-min window ratio (new orders):")
     sc = session_case("entry_ts")
     df_windows = con.execute(f"""
         SELECT {sc} AS time_window, COUNT(*) AS order_count
@@ -335,10 +328,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     print(f"  Ratio          : {ratio:.1f}×")
     results["Q6_window_ratio"] = df_windows
 
+    # 7 — Total cancelled orders (count + volume)
     # ════════════════════════════════════════════════════════════════════════
-    # Q7 — Total cancelled orders (count + volume)
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q7 · Total cancelled orders (full day)")
+    print_section("Total cancelled orders (full day):")
     df = con.execute(f"""
         SELECT
             COUNT(*)                   AS cancelled_events,
@@ -351,10 +343,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     print(df.to_string(index=False))
     results["Q7_cancellations"] = df
 
+    # 8 — 30-min window with most cancellations
     # ════════════════════════════════════════════════════════════════════════
-    # Q8 — 30-min window with most cancellations
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q8 · Cancellations per 30-min window (opening/closing separate)")
+    print_section("Cancellations per 30-min window (opening/closing separate):")
     sc = session_case("change_ts")
     df = con.execute(f"""
         SELECT
@@ -377,10 +368,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
         print("\n  → No cancellations found in this dataset.")
     results["Q8_cancel_windows"] = df
 
+    # 9 — Top/Bottom 10 stocks by cancelled-volume / executed-volume ratio
     # ════════════════════════════════════════════════════════════════════════
-    # Q9 — Top/Bottom 10 stocks by cancelled-volume / executed-volume ratio
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q9 · Stocks by ratio of cancelled volume to executed volume")
+    print_section("Stocks by ratio of cancelled volume to executed volume:")
     # Trade events: change_reason=3; executed qty = qty - remaining for that event
     df = con.execute(f"""
         WITH stock_stats AS (
@@ -409,10 +399,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     print(df.tail(10).to_string(index=False))
     results["Q9_cancel_trade_ratio"] = df
 
+    # 10 — Cancelled volume as % of initially submitted volume
     # ════════════════════════════════════════════════════════════════════════
-    # Q10 — Cancelled volume as % of initially submitted volume
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q10 · Cancelled volume as % of total initial order volume")
+    print_section("Cancelled volume as % of total initial order volume:")
     row = con.execute(f"""
         SELECT
             SUM(CASE WHEN change_reason = {NEW_REASON}
@@ -436,10 +425,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
         "pct_lots": pct(cl, nl), "pct_tl": pct(ct, nt)
     }])
 
+    # 11 — Overlap: top 10 by order volume vs top 10 by trade volume
     # ════════════════════════════════════════════════════════════════════════
-    # Q11 — Overlap: top 10 by order volume vs top 10 by trade volume
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q11 · Overlap: top 10 by order volume vs. top 10 by trade volume")
+    print_section("Overlap: top 10 by order volume vs. top 10 by trade volume:")
     top10_order = set(con.execute(f"""
         SELECT "ISLEM KODU" FROM orders
         WHERE change_reason = {NEW_REASON} AND {base_filter}
@@ -467,10 +455,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
         "stocks": [sorted(only_order), sorted(overlap), sorted(only_trade)]
     })
 
+    # 12 — Same window for highest order volume vs highest trade volume?
     # ════════════════════════════════════════════════════════════════════════
-    # Q12 — Same window for highest order volume vs highest trade volume?
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q12 · Highest order-volume window = highest trade-volume window?")
+    print_section("Highest order-volume window = highest trade-volume window?")
     sc_entry  = session_case("entry_ts")
     sc_change = session_case("change_ts")
 
@@ -500,10 +487,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
         print("  → Insufficient data (no trade events found).")
         results["Q12_peak_windows"] = pd.DataFrame()
 
+    # 13 — How many stocks concentrate 50% and 80% of order volume?
     # ════════════════════════════════════════════════════════════════════════
-    # Q13 — How many stocks concentrate 50% and 80% of order volume?
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q13 · Stocks concentrating 50% and 80% of total order volume")
+    print_section("Stocks concentrating 50% and 80% of total order volume:")
     df = con.execute(f"""
         WITH sv AS (
             SELECT "ISLEM KODU" AS stock, SUM(order_tl) AS tl
@@ -532,10 +518,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
         "total_stocks": df[0], "stocks_for_50pct": df[1], "stocks_for_80pct": df[2]
     }])
 
+    # 14 — 30-min window with highest average lot size per order
     # ════════════════════════════════════════════════════════════════════════
-    # Q14 — 30-min window with highest average lot size per order
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q14 · 30-min window with highest avg lot size per order")
+    print_section("30-min window with highest avg lot size per order:")
     sc = session_case("entry_ts")
     df = con.execute(f"""
         SELECT
@@ -553,10 +538,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
           f"(avg {df.iloc[0]['avg_lots_per_order']:,.0f} lots/order)")
     results["Q14_avg_lot_size"] = df
 
+    # 15 — Average order size (TL) in opening / midday / closing
     # ════════════════════════════════════════════════════════════════════════
-    # Q15 — Average order size (TL) in opening / midday / closing
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q15 · Average order size (TL) by period: opening / midday / closing")
+    print_section("Average order size (TL) by period: opening / midday / closing")
     bsc = broad_session_case("entry_ts")
     df = con.execute(f"""
         SELECT
@@ -574,10 +558,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     print(df.to_string(index=False))
     results["Q15_avg_order_size"] = df
 
+    # 16 — Top 100 orders by volume: opening vs closing session distribution
     # ════════════════════════════════════════════════════════════════════════
-    # Q16 — Top 100 orders by volume: opening vs closing session distribution
-    # ════════════════════════════════════════════════════════════════════════
-    print_section("Q16 · Top 100 orders by lot volume — session distribution")
+    print_section("Top 100 orders by lot volume — session distribution:")
     sc = session_case("entry_ts")
     df = con.execute(f"""
         WITH top100 AS (
@@ -603,14 +586,21 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     print(df.to_string(index=False))
     results["Q16_top100_sessions"] = df
 
-    # ════════════════════════════════════════════════════════════════════════
-    # Optional: export to Excel
+    # export to excel — all questions on one sheet, stacked vertically
     # ════════════════════════════════════════════════════════════════════════
     if output_path:
         print(f"\n\nWriting results to {output_path} ...")
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            for sheet_name, frame in results.items():
-                frame.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+            row = 0
+            for q_name, frame in results.items():
+                # section title row
+                pd.DataFrame([[q_name.replace("_", " · ")]]).to_excel(
+                    writer, sheet_name="Results", startrow=row, index=False, header=False
+                )
+                row += 1
+                # data table (includes column headers)
+                frame.to_excel(writer, sheet_name="Results", startrow=row, index=False)
+                row += 1 + len(frame) + 2  # header + data rows + 2 blank rows
         print("Done.")
 
     con.close()
@@ -619,8 +609,7 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     print("="*64 + "\n")
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
+# entry point
 # ────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

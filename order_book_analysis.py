@@ -26,6 +26,10 @@ import sys
 import argparse
 import duckdb
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from pathlib import Path
 
 # constants
@@ -41,6 +45,7 @@ CANCEL_REASONS = (
     10,  # CanceledOnBehalf
     13,  # IcebergRefresh
     15,  # CanceledBySystemLimitChange
+    19,  # Expired
     20,  # CanceledDueToISS
     34,  # CanceledAfterAuction
     41,  # QuoteCanceledDeltaMmProtection
@@ -60,7 +65,6 @@ ICEBERG_BIT = 32  # Undisclosed Quantity
 OPENING_SESSION_PATTERNS = ["ACILIS", "ACS_EMR"]
 CLOSING_SESSION_PATTERNS = ["KAPANIS", "ESLESTIRMETEKFIYAT"]
 
-# Continuous trading hours at BIST 
 CONTINUOUS_START_HOUR = 10
 CONTINUOUS_END_HOUR = 18
 
@@ -125,19 +129,54 @@ def pct(num, denom):
     return 100.0 * num / denom if denom else 0.0
 
 
-# MAIN 
+def compute_rolling_intensity(con, base_filter: str, window_minutes: int = 30) -> pd.DataFrame:
+    """Compute rolling order intensity at 1-minute granularity using a trailing window."""
+    return con.execute(f"""
+        WITH minute_counts AS (
+            SELECT
+                DATE_TRUNC('minute', entry_ts) AS minute_ts,
+                COUNT(*)       AS order_count,
+                SUM(qty)       AS lots,
+                SUM(order_tl)  AS tl
+            FROM orders
+            WHERE change_reason = {NEW_REASON}
+              AND {base_filter}
+              AND entry_ts IS NOT NULL
+            GROUP BY DATE_TRUNC('minute', entry_ts)
+        )
+        SELECT
+            minute_ts,
+            SUM(order_count) OVER (
+                ORDER BY minute_ts
+                RANGE BETWEEN INTERVAL '{window_minutes} minutes' PRECEDING AND CURRENT ROW
+            ) AS rolling_order_count,
+            SUM(lots) OVER (
+                ORDER BY minute_ts
+                RANGE BETWEEN INTERVAL '{window_minutes} minutes' PRECEDING AND CURRENT ROW
+            ) AS rolling_lots,
+            SUM(tl) OVER (
+                ORDER BY minute_ts
+                RANGE BETWEEN INTERVAL '{window_minutes} minutes' PRECEDING AND CURRENT ROW
+            ) AS rolling_tl
+        FROM minute_counts
+        ORDER BY minute_ts
+    """).fetchdf()
+
+
+# MAIN
 def run_analysis(csv_path: str, output_path=None) -> None:
     con = duckdb.connect()
     results: dict[str, pd.DataFrame] = {}
 
     print(f"\nLoading CSV via DuckDB (no full RAM load needed): {csv_path}")
 
-    # ── Create view ── 
+    # ── Create view ──
     # Column names contain spaces; reference them with double-quotes in SQL.
     # EMIR GIRIS TARIHI                              = order entry timestamp
     # EMIR DEGISTIRILME TARIHI                       = order change/cancel timestamp
     # EMIR MIKTARI                                   = order quantity (lots)
     # KALAN MIKTAR                                   = remaining quantity after this event
+    # GORUNEN MIKTAR                                 = visible (disclosed) quantity
     # FIYAT                                          = price (TL)
     # EMIR DEGISIKLIK SEBEBI                         = ChangeReason code
     # EMIR FIYAT TURU                                = OrderType (1=Limit, 2=Market …)
@@ -172,7 +211,7 @@ def run_analysis(csv_path: str, output_path=None) -> None:
 
     base_filter = f"order_cat = {NORMAL_ORDER_CAT}"
 
-    # 1 — Total new orders 
+    # 1 — Total new orders
     # ════════════════════════════════════════════════════════════════════════
     print_section("Total new orders submitted:")
     df = con.execute(f"""
@@ -275,23 +314,58 @@ def run_analysis(csv_path: str, output_path=None) -> None:
           f"({peak_tl['pct_tl']:.1f}%)")
     results["Q4_windows_new_orders"] = df
 
-    # 5 — Limit and iceberg ratio among new orders # Iceberg identification: any EMIR NO that generated a change_reason=13
+    # Rolling 30-min intensity chart
+    # ════════════════════════════════════════════════════════════════════════
+    print_section("Rolling 30-min order intensity (Q4b):")
+    rolling_df = compute_rolling_intensity(con, base_filter, window_minutes=30)
+    results["Q4b_rolling_intensity"] = rolling_df
+
+    if not rolling_df.empty:
+        out_dir = Path("output")
+        out_dir.mkdir(exist_ok=True)
+
+        peak_idx = rolling_df["rolling_order_count"].idxmax()
+        peak_row = rolling_df.loc[peak_idx]
+        peak_ts  = pd.Timestamp(peak_row["minute_ts"])
+
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.plot(rolling_df["minute_ts"], rolling_df["rolling_order_count"],
+                color="#4c72b0", linewidth=1)
+        ax.annotate(
+            f"{peak_ts.strftime('%H:%M')}\n{int(peak_row['rolling_order_count']):,} orders",
+            xy=(peak_row["minute_ts"], peak_row["rolling_order_count"]),
+            xytext=(20, -30), textcoords="offset points",
+            arrowprops=dict(arrowstyle="->", color="crimson"),
+            color="crimson", fontsize=9,
+        )
+        ax.set_title("Order Submission Intensity — Rolling 30-Minute Window")
+        ax.set_xlabel("Time of Day (end of rolling window)")
+        ax.set_ylabel("Orders in Window")
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        fig.autofmt_xdate()
+        plt.tight_layout()
+        chart_path = out_dir / "q4_rolling_intensity.png"
+        plt.savefig(chart_path, dpi=150)
+        plt.close()
+        print(f"  Chart saved: {chart_path}")
+        print(f"  Peak 30-min window ending {peak_ts.strftime('%H:%M')}: "
+              f"{int(peak_row['rolling_order_count']):,} orders, "
+              f"{int(peak_row['rolling_lots']):,} lots")
+    else:
+        print("  No data for rolling intensity chart.")
+
+    # 5 — Limit and iceberg ratio among new orders
     # ════════════════════════════════════════════════════════════════════════
     print_section("Limit and iceberg order ratio among new orders:")
     df = con.execute(f"""
-        WITH iceberg_ids AS (
-            SELECT DISTINCT "EMIR NO" AS ono
-            FROM orders
-            WHERE change_reason = 13 AND {base_filter}
-        ),
-        new_orders AS (
+        WITH new_orders AS (
             SELECT
-                o.qty,
-                o.order_type,
-                CASE WHEN i.ono IS NOT NULL THEN 1 ELSE 0 END AS is_iceberg
-            FROM orders o
-            LEFT JOIN iceberg_ids i ON o."EMIR NO" = i.ono
-            WHERE o.change_reason = {NEW_REASON} AND o.{base_filter}
+                qty,
+                order_type,
+                CASE WHEN visible_qty IS NOT NULL AND visible_qty != qty
+                     THEN 1 ELSE 0 END AS is_iceberg
+            FROM orders
+            WHERE change_reason = {NEW_REASON} AND {base_filter}
         )
         SELECT
             COUNT(*)                                                                   AS total_new,
@@ -342,6 +416,26 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     """).fetchdf()
     print(df.to_string(index=False))
     results["Q7_cancellations"] = df
+
+    # Expiry vs other cancellations
+    df_q7b = con.execute(f"""
+        SELECT
+            CASE WHEN change_reason = 19
+                 THEN 'Expired (reason 19)'
+                 ELSE 'Other cancellations'
+            END                    AS cancel_type,
+            COUNT(*)               AS events,
+            SUM(remaining)         AS lots,
+            SUM(remaining * price) AS tl
+        FROM orders
+        WHERE change_reason IN ({CANCEL_REASONS_SQL})
+          AND {base_filter}
+        GROUP BY 1
+        ORDER BY 1
+    """).fetchdf()
+    print("\n  Expiry vs. other cancellations:")
+    print(df_q7b.to_string(index=False))
+    results["Q7b_expiry_breakdown"] = df_q7b
 
     # 8 — 30-min window with most cancellations
     # ════════════════════════════════════════════════════════════════════════
@@ -487,13 +581,16 @@ def run_analysis(csv_path: str, output_path=None) -> None:
         print("  → Insufficient data (no trade events found).")
         results["Q12_peak_windows"] = pd.DataFrame()
 
-    # 13 — How many stocks concentrate 50% and 80% of order volume?
+    # 13 — How many stocks concentrate 50% and 80% of order volume? tickers ending in '.E'
     # ════════════════════════════════════════════════════════════════════════
-    print_section("Stocks concentrating 50% and 80% of total order volume:")
+    print_section("Stocks concentrating 50% and 80% of total order volume (equities only):")
     df = con.execute(f"""
         WITH sv AS (
             SELECT "ISLEM KODU" AS stock, SUM(order_tl) AS tl
-            FROM orders WHERE change_reason={NEW_REASON} AND {base_filter}
+            FROM orders
+            WHERE change_reason = {NEW_REASON}
+              AND {base_filter}
+              AND "ISLEM KODU" LIKE '%.E'
             GROUP BY "ISLEM KODU"
             ORDER BY tl DESC
         ),
@@ -511,9 +608,9 @@ def run_analysis(csv_path: str, output_path=None) -> None:
             COUNT(CASE WHEN cum_tl - tl < 0.80 * grand_total THEN 1 END) + 1 AS stocks_80pct
         FROM cumulative
     """).fetchone()
-    print(f"  Total unique stocks              : {df[0]:,}")
-    print(f"  Stocks to reach 50% of volume   : {df[1]}")
-    print(f"  Stocks to reach 80% of volume   : {df[2]}")
+    print(f"  Total unique equity stocks (.E)      : {df[0]:,}")
+    print(f"  Stocks to reach 50% of volume        : {df[1]}")
+    print(f"  Stocks to reach 80% of volume        : {df[2]}")
     results["Q13_concentration"] = pd.DataFrame([{
         "total_stocks": df[0], "stocks_for_50pct": df[1], "stocks_for_80pct": df[2]
     }])
@@ -538,7 +635,7 @@ def run_analysis(csv_path: str, output_path=None) -> None:
           f"(avg {df.iloc[0]['avg_lots_per_order']:,.0f} lots/order)")
     results["Q14_avg_lot_size"] = df
 
-    # 15 — Average order size (TL) in opening / midday / closing
+    # 15 — Average order size (TL) in opening / midday / closing; bar chart with mean bars and median markers
     # ════════════════════════════════════════════════════════════════════════
     print_section("Average order size (TL) by period: opening / midday / closing")
     bsc = broad_session_case("entry_ts")
@@ -557,6 +654,33 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     """).fetchdf()
     print(df.to_string(index=False))
     results["Q15_avg_order_size"] = df
+
+    # 15 chart
+    if not df.empty:
+        out_dir = Path("output")
+        out_dir.mkdir(exist_ok=True)
+
+        period_order = {'1_Opening': 0, '2_Midday': 1, '3_Closing': 2}
+        df_plot = df[df['period'].isin(period_order)].copy()
+        df_plot = df_plot.sort_values('period', key=lambda x: x.map(period_order))
+        labels = [p.split('_', 1)[1] for p in df_plot['period']]
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        x = list(range(len(df_plot)))
+        colors = ['#4c72b0', '#dd8452', '#55a868']
+        ax.bar(x, df_plot['avg_order_tl'], color=colors, alpha=0.85, label='Mean')
+        ax.scatter(x, df_plot['median_order_tl'], color='crimson', zorder=5,
+                   s=120, marker='D', label='Median')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=12)
+        ax.set_title('Average vs Median Order Size by Session')
+        ax.set_ylabel('Order Size (TL)')
+        ax.legend()
+        plt.tight_layout()
+        chart_path = out_dir / "q15_avg_order_size.png"
+        plt.savefig(chart_path, dpi=150)
+        plt.close()
+        print(f"\n  Q15 chart saved: {chart_path}")
 
     # 16 — Top 100 orders by volume: opening vs closing session distribution
     # ════════════════════════════════════════════════════════════════════════
@@ -586,7 +710,17 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     print(df.to_string(index=False))
     results["Q16_top100_sessions"] = df
 
-    # export to excel — all questions on one sheet, stacked vertically
+    # closing-session callout
+    z_rows = df[df["time_window"] == "Z_CLOSING"]
+    if not z_rows.empty:
+        z = z_rows.iloc[0]
+        print(f"\n  -> Of the 100 largest orders of the day, {int(z['count'])} "
+              f"landed in the closing auction (Z_CLOSING), "
+              f"totaling {int(z['total_lots']):,} lots.")
+    else:
+        print("\n  -> 0 of the top 100 orders landed in the closing auction (Z_CLOSING).")
+
+    # export to excel
     # ════════════════════════════════════════════════════════════════════════
     if output_path:
         print(f"\n\nWriting results to {output_path} ...")

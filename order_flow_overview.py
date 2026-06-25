@@ -1,25 +1,18 @@
 #!/usr/bin/env python3
 """
-Borsa Istanbul - Equity Market Full Order Book analysis with 16 research questions.
+Borsa Istanbul - Equity Market Full Order Book analysis; 16 overview questions.
 
 Delimiter: semicolon (;), encoding: UTF-8
 
-Key ChangeReason codes:
-  6  = New (initial order entry)
-  3  = Trade (order executed)
-  1  = CanceledByUser
-  9  = CanceledBySystem
-  5  = ReplacedByUser
-
 Usage:
-  python order_book_analysis.py /path/to/TED_YYYYMMDD.csv
-  python order_book_analysis.py /path/to/TED_YYYYMMDD.csv --output results.xlsx
+  python order_flow_overview.py /path/to/TED_YYYYMMDD.csv
+  python order_flow_overview.py /path/to/TED_YYYYMMDD.csv --output results.xlsx
 
 Notes:
   - The output file specified with --output must have a .xlsx extension.
   - The Excel output will contain multiple sheets, one for each research question.
-
-  The input CSV file must be semicolon-delimited (;) and match the column format.
+  - The input CSV file must be semicolon-delimited (;) and match the column format.
+  - Constants, SQL helpers, and the view setup live in ted_common.py.
 """
 
 import sys
@@ -32,101 +25,16 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from pathlib import Path
 
-# constants
-
-NEW_REASON = 6          # New order (first entry)
-TRADE_REASON = 3        # Order matched/executed
-NORMAL_ORDER_CAT = 1    # OrderCategory = Order (not quote, not trade report)
-
-# ChangeReason codes
-CANCEL_REASONS = (
-    1,   # CanceledByUser
-    9,   # CanceledBySystem
-    10,  # CanceledOnBehalf
-    13,  # IcebergRefresh
-    15,  # CanceledBySystemLimitChange
-    19,  # Expired
-    20,  # CanceledDueToISS
-    34,  # CanceledAfterAuction
-    41,  # QuoteCanceledDeltaMmProtection
-    42,  # QuoteCanceledAbsMmProtection
-    43,  # CrossingOrderDeleted
-    115, 116, 117, 118, 119, 120, 121, 122, 123, 124,  # CanceledByPtrm*
+from ted_common import (
+    NEW_REASON, TRADE_REASON, NORMAL_ORDER_CAT,
+    CANCEL_REASONS, CANCEL_REASONS_SQL,
+    LIMIT_ORDER_TYPE, ICEBERG_BIT,
+    session_case, broad_session_case,
+    create_orders_view, print_section, pct,
+    CHART_RCPARAMS,
 )
-CANCEL_REASONS_SQL = ",".join(map(str, CANCEL_REASONS))
 
-# OrderType (EMIR FIYAT TURU)
-LIMIT_ORDER_TYPE = 1   # Limit
-
-# ExchangeOrderType (EMIR TURU) - bitmask, bit 5 = Undisclosed (iceberg)
-ICEBERG_BIT = 32  # Undisclosed Quantity
-
-# Session classification
-OPENING_SESSION_PATTERNS = ["ACILIS", "ACS_EMR"]
-CLOSING_SESSION_PATTERNS = ["KAPANIS", "ESLESTIRMETEKFIYAT"]
-
-CONTINUOUS_START_HOUR = 10
-CONTINUOUS_END_HOUR = 18
-
-# DuckDB
-def session_case(time_col: str) -> str:
-    """
-    Classify:
-      - 'A_OPENING'  for opening session
-      - 'Z_CLOSING'  for closing session
-      - 'HH:MM-HH:MM' 30-min bucket for continuous trading
-    """
-    opening_filter = " OR ".join(
-        f"\"SEANS\" LIKE '%{p}%'" for p in OPENING_SESSION_PATTERNS
-    )
-    closing_filter = " OR ".join(
-        f"\"SEANS\" LIKE '%{p}%'" for p in CLOSING_SESSION_PATTERNS
-    )
-    return f"""
-        CASE
-            WHEN ({opening_filter}) OR EXTRACT(HOUR FROM {time_col}) < {CONTINUOUS_START_HOUR}
-                THEN 'A_OPENING'
-            WHEN ({closing_filter}) OR EXTRACT(HOUR FROM {time_col}) >= {CONTINUOUS_END_HOUR}
-                THEN 'Z_CLOSING'
-            ELSE
-                LPAD(CAST(EXTRACT(HOUR FROM {time_col}) AS VARCHAR), 2, '0') || ':' ||
-                CASE WHEN EXTRACT(MINUTE FROM {time_col}) < 30 THEN '00' ELSE '30' END
-                || '-' ||
-                CASE
-                    WHEN EXTRACT(MINUTE FROM {time_col}) < 30
-                        THEN LPAD(CAST(EXTRACT(HOUR FROM {time_col}) AS VARCHAR), 2, '0') || ':30'
-                    ELSE LPAD(CAST((EXTRACT(HOUR FROM {time_col}) + 1) AS VARCHAR), 2, '0') || ':00'
-                END
-        END
-    """
-
-
-def broad_session_case(time_col: str) -> str:
-    """Classifying Opening / Midday / Closing."""
-    opening_filter = " OR ".join(
-        f"\"SEANS\" LIKE '%{p}%'" for p in OPENING_SESSION_PATTERNS
-    )
-    closing_filter = " OR ".join(
-        f"\"SEANS\" LIKE '%{p}%'" for p in CLOSING_SESSION_PATTERNS
-    )
-    return f"""
-        CASE
-            WHEN ({opening_filter}) OR EXTRACT(HOUR FROM {time_col}) < {CONTINUOUS_START_HOUR}
-                THEN '1_Opening'
-            WHEN ({closing_filter}) OR EXTRACT(HOUR FROM {time_col}) >= {CONTINUOUS_END_HOUR}
-                THEN '3_Closing'
-            ELSE '2_Midday'
-        END
-    """
-
-
-def print_section(title: str) -> None:
-    print(f"\n{'='*64}")
-    print(f"  {title}")
-    print(f"{'='*64}")
-
-def pct(num, denom):
-    return 100.0 * num / denom if denom else 0.0
+plt.rcParams.update(CHART_RCPARAMS)
 
 
 def compute_rolling_intensity(con, base_filter: str, window_minutes: int = 30) -> pd.DataFrame:
@@ -169,45 +77,7 @@ def run_analysis(csv_path: str, output_path=None) -> None:
     results: dict[str, pd.DataFrame] = {}
 
     print(f"\nLoading CSV via DuckDB (no full RAM load needed): {csv_path}")
-
-    # ── Create view ──
-    # Column names contain spaces; reference them with double-quotes in SQL.
-    # EMIR GIRIS TARIHI                              = order entry timestamp
-    # EMIR DEGISTIRILME TARIHI                       = order change/cancel timestamp
-    # EMIR MIKTARI                                   = order quantity (lots)
-    # KALAN MIKTAR                                   = remaining quantity after this event
-    # GORUNEN MIKTAR                                 = visible (disclosed) quantity
-    # FIYAT                                          = price (TL)
-    # EMIR DEGISIKLIK SEBEBI                         = ChangeReason code
-    # EMIR FIYAT TURU                                = OrderType (1=Limit, 2=Market …)
-    # EMIR TURU                                      = ExchangeOrderType (bitmask)
-    # EMIR KATEGORISI                                = 1=Order, 4=Quote, 32=TradeReport
-    # SEANS                                          = Session name string
-
-    con.execute(f"""
-        CREATE VIEW orders AS
-        SELECT
-            *,
-            TRY_CAST("EMIR GIRIS TARIHI"      AS TIMESTAMP) AS entry_ts,
-            TRY_CAST("EMIR DEGISTIRILME TARIHI" AS TIMESTAMP) AS change_ts,
-            TRY_CAST("EMIR MIKTARI"            AS DOUBLE)  AS qty,
-            TRY_CAST("KALAN MIKTAR"            AS DOUBLE)  AS remaining,
-            TRY_CAST("GORUNEN MIKTAR"          AS DOUBLE)  AS visible_qty,
-            TRY_CAST("FIYAT"                   AS DOUBLE)  AS price,
-            TRY_CAST("EMIR DEGISIKLIK SEBEBI"  AS INTEGER) AS change_reason,
-            TRY_CAST("EMIR FIYAT TURU"         AS INTEGER) AS order_type,
-            TRY_CAST("EMIR TURU"               AS INTEGER) AS exch_order_type,
-            TRY_CAST("EMIR KATEGORISI"         AS INTEGER) AS order_cat,
-            TRY_CAST("EMIR MIKTARI"            AS DOUBLE)
-                * TRY_CAST("FIYAT" AS DOUBLE)              AS order_tl
-        FROM read_csv(
-            '{csv_path}',
-            delim=';',
-            header=true,
-            ignore_errors=true,
-            parallel=true
-        )
-    """)
+    create_orders_view(con, csv_path)
 
     base_filter = f"order_cat = {NORMAL_ORDER_CAT}"
 
@@ -748,7 +618,7 @@ def run_analysis(csv_path: str, output_path=None) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="BIST full order book analysis"
+        description="BIST full order book analysis (16 overview questions)"
     )
     parser.add_argument("csv_file", help="Path to TED CSV file (semicolon-delimited)")
     parser.add_argument(

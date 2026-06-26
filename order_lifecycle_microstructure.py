@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Borsa Istanbul – Order Lifecycle & Microstructure Analysis
+Borsa Istanbul - Order Lifecycle & Microstructure Analysis
 
 Reconstructs a per-order lifecycle from EMIR NO grouping and answers:
   Q-L1  Order lifetime distribution (emir bekleme süresi)
   Q-L2  HFT-like behavioral fingerprint share
   Q-L3  Passive vs aggressive liquidity
   Q-L4  Order conversion funnel
-  Q-L5  Resting time vs outcome cross-analysis
+  Q-L5  Resting time vs outcome cross-analysis (E1 vs E1_1)
   Q-L6  HFT-like share by time of day
 
 Usage:
@@ -20,7 +20,7 @@ Usage:
   # Dev: full analysis on smaller sample (faster):
   python order_lifecycle_microstructure.py /path/to/CSV --sample 0.05
 
-IMPORTANT – HFT CAVEAT (printed at runtime too):
+IMPORTANT - HFT CAVEAT (printed at runtime too):
   'likely_hft' identifies HFT-LIKE BEHAVIORAL PATTERNS inferred from order timing
   and lifecycle data. This dataset contains no trader IDs. All behavioral
   classifications are proxies only — NOT confirmed participant identity.
@@ -41,7 +41,7 @@ from ted_common import (
     CANCEL_REASONS, CANCEL_REASONS_SQL,
     CONTINUOUS_START_HOUR, CONTINUOUS_END_HOUR,
     create_orders_view, print_section, pct,
-    CHART_RCPARAMS,
+    CHART_RCPARAMS, timestamped_path,
 )
 
 plt.rcParams.update(CHART_RCPARAMS)
@@ -142,6 +142,10 @@ def build_lifecycle_table(con: duckdb.DuckDBPyConnection, sample_pct: float = 1.
 
     traded_lots uses MAX(qty-remaining) across trade events, which equals the net
     filled quantity. SUM would double-count because qty-remaining is cumulative.
+
+    n_qualifying_improvements = MAX(sub_order_number): counts how many times the
+    order was improved (price improvement or lot increase via change_reason=5).
+    Each improvement resets BIST time-priority. Computed via LAG window functions.
     """
     sample_clause = ""
     if sample_pct < 1.0:
@@ -150,6 +154,43 @@ def build_lifecycle_table(con: duckdb.DuckDBPyConnection, sample_pct: float = 1.
 
     con.execute(f"""
         CREATE TEMP TABLE order_lifecycle AS
+        WITH base AS (
+            SELECT
+                "EMIR NO", "ALIS_SATIS", "ISLEM KODU",
+                change_reason, entry_ts, change_ts, price, qty, remaining
+            FROM orders
+            WHERE order_cat = {NORMAL_ORDER_CAT}
+            {sample_clause}
+        ),
+        with_lag AS (
+            SELECT *,
+                LAG(price) OVER (PARTITION BY "EMIR NO" ORDER BY change_ts, entry_ts) AS prev_price,
+                LAG(qty)   OVER (PARTITION BY "EMIR NO" ORDER BY change_ts, entry_ts) AS prev_qty
+            FROM base
+        ),
+        with_qualifies AS (
+            SELECT *,
+                CASE
+                    WHEN change_reason = 5
+                         AND prev_price IS NOT NULL
+                         AND (
+                             ("ALIS_SATIS" = 'A' AND price > prev_price) OR
+                             ("ALIS_SATIS" = 'S' AND price < prev_price) OR
+                             (qty > prev_qty)
+                         )
+                    THEN 1 ELSE 0
+                END AS qualifies
+            FROM with_lag
+        ),
+        with_sub AS (
+            SELECT *,
+                SUM(qualifies) OVER (
+                    PARTITION BY "EMIR NO"
+                    ORDER BY change_ts, entry_ts
+                    ROWS UNBOUNDED PRECEDING
+                ) AS sub_order_number
+            FROM with_qualifies
+        )
         SELECT
             "EMIR NO"                                                             AS order_id,
             MAX("ISLEM KODU")                                                     AS stock,
@@ -172,10 +213,10 @@ def build_lifecycle_table(con: duckdb.DuckDBPyConnection, sample_pct: float = 1.
             EXTRACT(EPOCH FROM (
                 MIN(CASE WHEN change_reason = {TRADE_REASON} THEN change_ts END) -
                 MIN(CASE WHEN change_reason = {NEW_REASON}   THEN entry_ts  END)
-            ))                                                                     AS time_to_first_fill_seconds
-        FROM orders
-        WHERE order_cat = {NORMAL_ORDER_CAT}
-          {sample_clause}
+            ))                                                                     AS time_to_first_fill_seconds,
+            COUNT(CASE WHEN change_reason = 5 THEN 1 END)                         AS n_modifications,
+            MAX(sub_order_number)                                                  AS n_qualifying_improvements
+        FROM with_sub
         GROUP BY "EMIR NO"
         HAVING MIN(CASE WHEN change_reason = {NEW_REASON} THEN entry_ts END) IS NOT NULL
     """)
@@ -341,7 +382,7 @@ def question_l1(con: duckdb.DuckDBPyConnection, out_dir: Path, results: dict) ->
     fig.suptitle("Order Lifetime Distribution", fontsize=12, fontweight='bold')
     plt.tight_layout()
     out_dir.mkdir(exist_ok=True)
-    path = out_dir / "ql1_lifetime_distribution.png"
+    path = out_dir / "lifetime_distribution.png"
     plt.savefig(path, dpi=300)
     plt.close()
     print(f"\n  Chart saved: {path}")
@@ -427,7 +468,7 @@ def question_l2(con: duckdb.DuckDBPyConnection, out_dir: Path, results: dict) ->
     ax.legend()
     plt.tight_layout()
     out_dir.mkdir(exist_ok=True)
-    path = out_dir / "ql2_order_classification.png"
+    path = out_dir / "behavioral_classification.png"
     plt.savefig(path, dpi=300)
     plt.close()
     print(f"\n  Chart saved: {path}")
@@ -550,7 +591,7 @@ def question_l4(con: duckdb.DuckDBPyConnection, out_dir: Path, results: dict) ->
     ax.set_xlim(0, df_plot["pct_orders"].max() * 1.35)
     plt.tight_layout()
     out_dir.mkdir(exist_ok=True)
-    path = out_dir / "ql4_conversion_funnel.png"
+    path = out_dir / "conversion_funnel.png"
     plt.savefig(path, dpi=300)
     plt.close()
     print(f"\n  Chart saved: {path}")
@@ -635,7 +676,7 @@ def question_l6(con: duckdb.DuckDBPyConnection, out_dir: Path, results: dict) ->
         ax.tick_params(axis='x', rotation=45)
         plt.tight_layout()
         out_dir.mkdir(exist_ok=True)
-        path = out_dir / "ql6_hft_intraday.png"
+        path = out_dir / "algorithmic_activity_intraday.png"
         plt.savefig(path, dpi=300)
         plt.close()
         print(f"\n  Chart saved: {path}")
@@ -647,6 +688,33 @@ def question_l6(con: duckdb.DuckDBPyConnection, out_dir: Path, results: dict) ->
         print("  Compare with the peak order-submission window from order_flow_overview.py.")
         print("  Algorithmic activity typically concentrates near the open when price")
         print("  discovery uncertainty is highest.")
+
+
+# ── Order version distribution ────────────────────────────────────────────────
+
+def question_versions(con: duckdb.DuckDBPyConnection, results: dict) -> None:
+    print_section("Order Version Distribution (qualifying improvements per order)")
+
+    df = con.execute("""
+        SELECT
+            n_qualifying_improvements                                              AS versions_created,
+            COUNT(*)                                                               AS n_orders,
+            ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2)                   AS pct_of_orders
+        FROM order_lifecycle
+        GROUP BY 1
+        ORDER BY 1
+        LIMIT 15
+    """).fetchdf()
+    print(df.to_string(index=False))
+    results["Order_Versions"] = df
+
+    total    = int(df["n_orders"].sum())
+    improved = int(df[df["versions_created"] > 0]["n_orders"].sum()) if not df.empty else 0
+    print(f"\n  Orders with at least one qualifying improvement: {improved:,}  "
+          f"({100.0 * improved / total:.1f}% of all orders)")
+    print(f"  Each qualifying improvement = price improvement (buy raises / sell lowers)")
+    print(f"  or lot increase via change_reason=5. Causes time-priority reset in BIST queue.")
+    print(f"  The composite_id column in enrich_ted.py tracks this as EMIRNO_0, EMIRNO_1, etc.")
 
 
 # ── Full analysis runner ──────────────────────────────────────────────────────
@@ -662,6 +730,7 @@ def run_questions(
     question_l4(con, out_dir, results)
     question_l5(con, results)
     question_l6(con, out_dir, results)
+    question_versions(con, results)
 
 
 def _write_excel(results: dict, output_path: str) -> None:
@@ -686,9 +755,13 @@ def run_analysis(
     sample_pct: float = 0.01,
     output_path: str = "lifecycle_results.xlsx",
     out_dir: Path = OUTPUT_DIR,
+    use_timestamp: bool = True,
 ) -> None:
     con = duckdb.connect()
     results: dict[str, pd.DataFrame] = {}
+
+    if use_timestamp:
+        output_path = timestamped_path(output_path)
 
     print(f"\nLoading CSV: {csv_path}")
     create_orders_view(con, csv_path)
@@ -727,7 +800,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("csv_file", help="Path to semicolon-delimited order file")
     parser.add_argument("--output", "-o", default="lifecycle_results.xlsx",
-                        help="Excel output file (default: lifecycle_results.xlsx)")
+                        help="Excel output base name — timestamp is added automatically (default: lifecycle_results.xlsx)")
     parser.add_argument("--validate-only", action="store_true",
                         help="Build lifecycle table on sample, show validation, stop")
     parser.add_argument("--sample", type=float, default=0.01, metavar="FRAC",

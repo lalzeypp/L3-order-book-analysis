@@ -7,6 +7,8 @@ Imported by both order_flow_overview.py and order_lifecycle.py.
 
 import duckdb
 import pandas as pd
+from datetime import datetime
+from pathlib import Path
 
 # ChangeReason 
 NEW_REASON       = 6   # New 
@@ -150,6 +152,16 @@ def create_orders_view(con: duckdb.DuckDBPyConnection, csv_path: str) -> None:
             parallel=true
         )
     """)
+
+def timestamped_path(base_path: str) -> str:
+    """Return base_path with YYYYMMDD_HHMM inserted before the extension.
+
+    Example: 'overview_results.xlsx' -> 'overview_results_20260626_1430.xlsx'
+    """
+    p = Path(base_path)
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    return str(p.parent / f"{p.stem}_{ts}{p.suffix}")
+
 
 def print_section(title: str) -> None:
     print(f"\n{'='*64}")

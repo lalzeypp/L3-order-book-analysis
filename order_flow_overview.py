@@ -5,8 +5,8 @@ Borsa Istanbul - Equity Market Full Order Book analysis; 16 overview questions.
 Delimiter: semicolon (;), encoding: UTF-8
 
 Usage:
-  python order_flow_overview.py /path/to/TED_YYYYMMDD.csv
-  python order_flow_overview.py /path/to/TED_YYYYMMDD.csv --output results.xlsx
+  python3 order_flow_overview.py /path/to/TED_YYYYMMDD.csv
+  python3 order_flow_overview.py /path/to/TED_YYYYMMDD.csv --output overview_results.xlsx
 
 Notes:
   - The output file specified with --output must have a .xlsx extension.
@@ -31,7 +31,7 @@ from ted_common import (
     LIMIT_ORDER_TYPE, ICEBERG_BIT,
     session_case, broad_session_case,
     create_orders_view, print_section, pct,
-    CHART_RCPARAMS,
+    CHART_RCPARAMS, timestamped_path,
 )
 
 plt.rcParams.update(CHART_RCPARAMS)
@@ -75,6 +75,9 @@ def compute_rolling_intensity(con, base_filter: str, window_minutes: int = 30) -
 def run_analysis(csv_path: str, output_path=None) -> None:
     con = duckdb.connect()
     results: dict[str, pd.DataFrame] = {}
+
+    if output_path:
+        output_path = timestamped_path(output_path)
 
     print(f"\nLoading CSV via DuckDB (no full RAM load needed): {csv_path}")
     create_orders_view(con, csv_path)
@@ -214,7 +217,7 @@ def run_analysis(csv_path: str, output_path=None) -> None:
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
         fig.autofmt_xdate()
         plt.tight_layout()
-        chart_path = out_dir / "q4_rolling_intensity.png"
+        chart_path = out_dir / "order_flow_intensity.png"
         plt.savefig(chart_path, dpi=150)
         plt.close()
         print(f"  Chart saved: {chart_path}")
@@ -547,7 +550,7 @@ def run_analysis(csv_path: str, output_path=None) -> None:
         ax.set_ylabel('Order Size (TL)')
         ax.legend()
         plt.tight_layout()
-        chart_path = out_dir / "q15_avg_order_size.png"
+        chart_path = out_dir / "avg_order_size_by_session.png"
         plt.savefig(chart_path, dpi=150)
         plt.close()
         print(f"\n  Q15 chart saved: {chart_path}")
@@ -623,8 +626,8 @@ if __name__ == "__main__":
     parser.add_argument("csv_file", help="Path to TED CSV file (semicolon-delimited)")
     parser.add_argument(
         "--output", "-o",
-        help="Optional path for Excel output (e.g. results.xlsx)",
-        default=None,
+        help="Path for Excel output (default: overview_results.xlsx)",
+        default="overview_results.xlsx",
     )
     args = parser.parse_args()
 

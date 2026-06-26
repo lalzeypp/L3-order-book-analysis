@@ -1,0 +1,303 @@
+=================================
+BIST/ ORDER BOOK ANALYSIS - GUIDE
+=================================
+Analyses trading day(s) using the raw TED order file (e.g PP_GUNICIEMIR_YYYYMMDD_E.csv). Every time something happens to an order (it is placed,
+partially filled, modified, cancelled, or expires) a new row is written with the same EMIR NO, so the same order can appear dozens of times. The analysis is split across three scripts, each producing its own results xlsx file. 
+
+All three share a setup file ted_common.py which they import.
+
+The data is read directly by DuckDB, a query engine that scans the file without
+loading all 59 million rows into memory. A view is created over the file so all
+three scripts can query it with SQL.
+
+THE EXCEL FILES AND CHARTS
+---------------------------
+Each script creates its own Excel file. A timestamp (date and time) is added to the
+filename automatically every time a script runs, so old results are never overwritten.
+New files are always created alongside the previous ones.
+
+= overview_results_YYYYMMDD_HHMM.xlsx
+  Created by order_flow_overview.py. Contains all the market-level statistics:
+  order volume, buy vs sell split, cancellations, top stocks, intraday timing, etc.
+  Updates every time you run order_flow_overview.py.
+
+= lifecycle_results_YYYYMMDD_HHMM.xlsx
+  Created by order_lifecycle_microstructure.py. Contains the per-order lifecycle
+  analysis: how long orders lived, how many traded, what their outcome was, and
+  behavioral classifications. Updates every time you run that script.
+
+= modification_validation_YYYYMMDD_HHMM.xlsx
+  Created by order_modification_validator.py. Contains the sub-order version
+  analysis: which orders were improved, how long each version lasted, and
+  which stocks have the most active order repricing. Updates every time you run
+  that script.
+
+The chart files are:
+  order_flow_intensity.png        — rolling order submission rate through the day
+  avg_order_size_by_session.png   — average order size across opening, midday, closing
+  lifetime_distribution.png       — how long orders live before being resolved
+  behavioral_classification.png   — breakdown of order types by behavioral pattern
+  conversion_funnel.png           — what fraction of orders filled, cancelled, or expired
+  algorithmic_activity_intraday.png — algorithmic-like order share across time of day
+
+Charts are overwritten each run (no ts).
+
+----------------------
+order_flow_overview.py
+----------------------
+- Total order volume:
+  Counts every row where an order was newly placed (change_reason = 6). Sums the lot
+  count and the TL value at submission price. This is the baseline that all other
+  figures are measured against.
+
+- Buy vs sell split:
+  Same filter as above but split by ALIS_SATIS. If one side has a higher share of TL
+  value than of order count, that side's orders are on average larger. In the data, buy
+  orders were 54.6% of count but 58.3% of TL, meaning buyers submitted larger orders
+  on average than sellers that day. 
+
+- Top 10 stocks by order value:
+  Groups new orders by ticker and sums their TL value. A stock with a high lot share
+  but low TL share has a low price per share — you need many lots to move meaningful
+  money. The opposite (high TL, low lots) means an expensive stock where each order
+  carries a lot of value.
+
+- Order flow across 30-minute windows:
+  Classifies every new order into a time slot — either the opening auction, the closing
+  auction, or a 30-minute interval during continuous trading — then counts orders and
+  volume per slot. The 10:00-10:30 slot had 15.5% of the whole day's orders, which is
+  the typical opening surge when participants who waited through the pre-open submit
+  simultaneously once continuous trading starts.
+
+- Limit vs iceberg orders:
+  Identifies iceberg orders by looking for EMIR NOs that appear with change_reason = 13
+  (iceberg refresh). If an order refreshed at least once, it is confirmed as an iceberg.
+  Among all new orders, 96.8% were plain limit orders and only 0.06% were icebergs,
+  but icebergs represented 0.56% of lot volume — rare but large, consistent with
+  institutional use.
+
+- Busiest vs quietest 30-minute window:
+  Takes the ratio of the highest to the lowest order count across all 30-minute windows.
+  A large ratio means order flow is uneven and concentrated into short bursts.
+
+- Total cancellations:
+  Counts all rows where the event code is one of the cancellation types. Uses the
+  remaining column (not qty) because remaining at the point of cancellation is the
+  quantity that was actually pulled from the market. An order that filled 70 lots then
+  cancelled the rest would show remaining = 30 at the cancel event.
+
+- Cancellations by time window:
+  Same as above but split by 30-minute windows, using the timestamp of the cancel event
+  (not when the order was originally placed). This shows when orders are being pulled,
+  not when they were placed.
+
+- Cancel-to-trade ratio by stock:
+  For each stock, divides total cancelled lots by total traded lots. A high ratio can
+  mean heavy algorithmic activity with frequent order placement and cancellation, or it
+  can mean an illiquid stock where most orders simply never find a counterparty. Always
+  check the absolute traded volume before drawing conclusions — a ratio of 50 based on
+  1,000 traded lots is meaningless.
+
+- Cancel rate as a share of submitted volume:
+  A single percentage: of all lots submitted during the day, what fraction was eventually
+  cancelled. This is the cleanest one-number summary of how cancel-heavy the market was.
+
+- Top stocks by orders vs top stocks by trades:
+  Finds the 10 stocks with the most order value and separately the 10 with the most
+  traded value, then compares the two lists. A stock that appears in the order top-10
+  but not the trade top-10 is attracting large submission volumes that mostly evaporate.
+
+- Peak order window vs peak trade window:
+  Finds the single 30-minute window with the highest submission value and the single
+  window with the highest executed trade value. These often differ — the opening surge
+  dominates order submissions while executed volume peaks at a different time.
+
+- Market concentration:
+  Ranks all stocks by order value and computes a running total. Finds how many stocks
+  it takes to reach 50% and then 80% of the day's total order value. In the data, just
+  18 stocks account for half of all order value; the remaining several hundred stocks
+  share the other half.
+
+- Largest average order size by time window:
+  Groups new orders by 30-minute window and computes the average lot size per order in
+  each window. This is separate from total volume — a window with few but very large
+  orders answers differently here than in the total-volume analysis.
+
+- Average order size by broad session:
+  Computes both mean and median order value in TL across three broad periods: opening
+  auction, midday continuous trading, and closing auction. The median is included because
+  a handful of large block orders can inflate the mean without representing typical
+  behaviour. When mean is much higher than median, a few outliers are pulling the
+  average up.
+
+- Where the biggest orders appear:
+  Takes the 100 single largest orders of the day (by lot count) and counts how many
+  fell in each time window. In the data, 98 of the 100 largest orders were placed in
+  the opening auction. Large orders prefer the opening call auction because all matched
+  participants receive the same clearing price regardless of size, avoiding the
+  price impact of walking through multiple levels of the continuous book.
+
+---------------------------------
+order_lifecycle_microstructure.py
+---------------------------------
+This script shifts the unit of analysis from individual event rows to whole orders.
+It collapses all events of each order number into a single summary row — one row per order.
+This lets you ask what happened to an order over its entire life rather than looking
+at isolated events.
+
+Run it on the full daily file:
+  python3 order_lifecycle_microstructure.py /path/to/CSV --full
+
+Without --full it uses a 1% hash-based sample for speed. The same command works
+on a month-long CSV — just point it at the bigger file and use --full.
+
+The lifecycle summary row for each order records: when it was placed, when it last
+had an event, when it first filled (if it ever did), its original size, how many
+events it had, whether it ever traded, whether it was ever cancelled, whether it
+expired, how many lots actually traded, how long it lived in total, how long between
+submission and first fill, how many times it was modified (n_modifications), and how
+many of those modifications were genuine improvements that reset BIST time-priority
+(n_qualifying_improvements).
+
+How long orders live:
+Puts each order into a lifetime bucket: under 0.1 seconds, 0.1 to 1 second, 1 to 5
+seconds, 5 to 30 seconds, 30 seconds to 5 minutes, 5 to 30 minutes, over 30 minutes,
+or a special end-of-day bucket for orders that expired at market close. The result
+typically shows a strong split: a large cluster of very short-lived orders (placed and
+cancelled within seconds) and a long tail of patient orders sitting in the book for
+minutes or hours. The median is much more informative than the mean here because a few
+multi-hour orders inflate the average dramatically.
+
+Behavioral classification:
+Labels each order according to how it behaved, based purely on its timing. An order
+that filled within 100 milliseconds of being placed is called aggressive — it arrived
+ready to match and took liquidity immediately. An order that lived under 1 second,
+was cancelled, and never traded is called likely algorithmic — the hallmark of
+automated strategies that place and pull orders rapidly. An order that either waited
+over a minute before its first fill, or sat until end of day without trading, is called
+likely passive — a resting limit order providing liquidity to the book. Everything else
+is mixed. These are behavioral inferences from timing only; there are no trader IDs
+in the data, so none of these are confirmed identities. The top 15 stocks by
+algorithmic-like order count are also shown, with a warning to check absolute order
+counts before interpreting percentage figures for illiquid stocks.
+
+Passive vs aggressive liquidity:
+Among orders that did trade, separates those that filled within 100 milliseconds
+(they crossed the spread on arrival and took liquidity) from those that took longer
+(they rested in the book and had liquidity provided to them). Computes the share of
+total traded lots contributed by each type. A market where most traded volume came
+from resting orders has deep book depth; one dominated by immediate-fill orders is
+thinner and potentially more volatile.
+
+Order conversion funnel:
+Classifies each order's final outcome. Fully filled means traded lots reached at least
+99% of the original size. Partially filled means some trading happened but then the
+rest was cancelled or expired. Cancelled without fill and expired without fill are
+separated — expired orders also trigger the cancellation flag in the raw data, so the
+script checks for expiry first to avoid miscounting. The remaining orders are still
+open at the end of the capture period. The result shows what fraction of submitted
+orders actually found counterparties vs evaporated before trading.
+
+Resting time crossed with outcome:
+For each lifetime bucket, shows the breakdown of outcomes: what fraction of orders in
+that bucket fully filled, partially filled, were cancelled, expired, or remained open.
+Sub-second orders with a high cancellation rate confirm the algorithmic pattern.
+Long-resting orders with high full-fill rates represent patient value investors whose
+limit prices the market eventually reached.
+
+Algorithmic-like activity by time of day:
+For each 30-minute window during the day, computes what fraction of orders submitted
+in that window match the algorithmic pattern (placed and cancelled within 1 second
+without filling). If this fraction peaks near the opening, it suggests that the
+opening surge in order activity is predominantly algorithmic. The result can be
+compared against the overall order-flow window analysis from the first script.
+
+Order version distribution:
+Uses n_qualifying_improvements to show how many orders were never improved, improved
+once, twice, and so on. A qualifying improvement is any change_reason=5 event where
+the trader raised a buy price, lowered a sell price, or increased lot size. Each one
+causes the order to lose time priority in the BIST queue — it is effectively resubmitted
+from scratch at that price level. This table appears in the lifecycle Excel alongside
+the other results.
+
+--------------------------------
+order_modification_validator.py
+--------------------------------
+This script focuses on orders that were modified by the trader after being placed
+(change_reason = 5, called ReplacedByUser in the data). The key question is whether
+a modification represents a genuine improvement — the trader is now competing more
+aggressively — or just a neutral or worsening adjustment.
+
+An improvement is defined as either a price improvement (a buy order raises its price,
+or a sell order lowers its asking price) or a lot increase (the trader adds more
+size). Either condition alone counts. The comparison is always against the immediately
+preceding row of the same order, not against the original submission.
+
+Each time a qualifying improvement happens, the order gets a new version number.
+The original submission is version 0. The first improvement makes it version 1, and
+so on. This is represented as a composite ID in the form EMIRNO_0, EMIRNO_1, etc.
+This matters for microstructure analysis because in BIST's price-time priority system,
+any qualifying modification causes the order to lose its queue position and restart as
+a new submission at that price level. So each version is effectively a fresh order from
+the exchange's perspective.
+
+The validation output shows the full event history for 5 real sample orders, with a
+column explaining what changed at each event and whether it qualified. A version
+summary then collapses this to one row per version, showing the price and size at
+each version's start and how long that version spent in the book before being replaced
+or ending.
+
+The distribution analysis uses a 1% hash sample to show, across all orders in the
+dataset, how many orders were never improved, how many were improved once, twice, and
+so on. The per-stock breakdown shows which stocks have the highest share of actively
+repriced orders.
+
+To look up any specific order from the terminal without opening the Excel file:
+
+  python3 order_modification_validator.py /path/to/CSV --lookup "EMIR_NO_HERE"
+
+This prints the full version history for that order directly in the terminal.
+
+
+-------------
+enrich_ted.py
+-------------
+This script writes a new file (Parquet by default) that is a copy of the TED data
+for all regular orders (order_cat=1) with two extra columns added to every row:
+
+  sub_order_number   integer — 0 for the original submission, 1 after the first
+                     qualifying improvement, 2 after the second, etc.
+  composite_id       string  — EMIRNO_0, EMIRNO_1, etc.
+
+This lets you join the composite ID back to raw event rows for any downstream
+analysis where you need to track exactly which version of an order a row belongs to.
+
+Run it as:
+  python3 enrich_ted.py /path/to/CSV
+
+Output goes to the same folder as the input CSV, named <input>_enriched.parquet.
+For a full daily file expect 5-15 minutes. For monthly files, longer.
+
+Use --csv if you want a CSV output instead of Parquet:
+  python3 enrich_ted.py /path/to/CSV --csv --output enriched.csv
+
+Parquet is much smaller and faster to query. To look at rows from a Parquet file:
+  python3 -c "import duckdb; print(duckdb.query(\"SELECT * FROM 'file.parquet' LIMIT 5\").df())"
+
+Note: the individual order lookup (--lookup in the validator) does not require
+running enrich_ted.py first. Enrich is for when you need the composite_id attached
+to every row of the raw data for bulk analysis.
+
+THE SHARED MODULE — ted_common.py
+-----------------------------------
+This file is not run directly. It is imported by all three scripts. It holds the
+shared constants, helper functions, and the DuckDB view setup so that the three
+scripts do not duplicate code.
+
+The constants define the key change_reason codes, the list of all cancellation
+reason codes, and settings for session classification. The session classification
+helpers build SQL logic that puts each order event into a time bucket (opening auction,
+closing auction, or a 30-minute continuous-trading interval) based on the session name
+column and the event timestamp. The view setup function creates the DuckDB view over
+the raw CSV with all the column type conversions applied. The timestamped path function
+adds the current date and time to an output filename before saving.
